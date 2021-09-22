@@ -1,0 +1,208 @@
+name: Terraform Apply
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'prod'
+      - 'stage'
+      - 'test'
+      - 'develop'
+    paths:
+      - '**terraform**'
+
+jobs:
+  apply:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        region: [ us-east-1 ]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@main
+
+      - uses: rlespinasse/github-slug-action@v2.x
+
+      - name: Set Github Branch Source
+        run: |
+          if [[ "${{ github.event.pull_request.base.ref }}" == "" ]] ; then
+            echo "GITHUB_BRANCH=$GITHUB_REF_SLUG" >> $GITHUB_ENV
+          else
+            echo "GITHUB_BRANCH=$GITHUB_BASE_REF_SLUG" >> $GITHUB_ENV
+          fi
+
+      - name: Parse Repo/Branch Vars
+        run: |
+          export REPO_REGEX='^bardavon-health-(.+?)-(.+?)-(.+?)(-security)?$'
+          echo "REPO_PROVIDER=`echo $GITHUB_REPOSITORY_SLUG | perl -pe 's/$ENV{'REPO_REGEX'}/$1/g'`" >> $GITHUB_ENV
+          echo "REPO_COMPANY=`echo $GITHUB_REPOSITORY_SLUG | perl -pe 's/$ENV{'REPO_REGEX'}/$2/g'`" >> $GITHUB_ENV
+          echo "REPO_APP=`echo $GITHUB_REPOSITORY_SLUG | perl -pe 's/$ENV{'REPO_REGEX'}/$3/g'`" >> $GITHUB_ENV
+          echo "REPO_SUFFIX=`echo $GITHUB_REPOSITORY_SLUG | perl -pe 's/$ENV{'REPO_REGEX'}/$4/g'`" >> $GITHUB_ENV
+          export BRANCH_REGEX='^(lab-|.*sandbox-)?(.+?)(-iam)?$'
+          echo "BRANCH_PREFIX=`echo $GITHUB_BRANCH | perl -pe 's/$ENV{'BRANCH_REGEX'}/\U$1/g'`" >> $GITHUB_ENV
+          echo "BRANCH_ENV=`echo $GITHUB_BRANCH | perl -pe 's/$ENV{'BRANCH_REGEX'}/$2/g; s/develop/dev/g'`" >> $GITHUB_ENV
+          echo "BRANCH_NAME=`echo $GITHUB_BRANCH | perl -pe 's/$ENV{'BRANCH_REGEX'}/$2$3/g'`" >> $GITHUB_ENV
+
+      - name: Test Parse Repo/Branch Vars
+        run: |
+          if [ -z "$REPO_PROVIDER" -o \
+               -z "$REPO_COMPANY" -o \
+               -z "$REPO_APP" -o \
+               -z "$BRANCH_ENV" -o \
+               -z "$BRANCH_NAME" ] ; then
+            echo 'Failed to Parse Repo/Branch Vars!' ; exit 1
+          fi
+
+      - name: Get Accesss Key Prefix
+        run: |
+          if [[ "$REPO_SUFFIX" == "-security" ]] ; then
+            echo 'ACCESS_KEY_PREFIX=IAM_' >> $GITHUB_ENV
+          else
+            echo 'ACCESS_KEY_PREFIX=' >> $GITHUB_ENV
+          fi
+
+      - name: Set Secret names for Org Access
+        run: |
+          echo "ORG_AWS_ACCESS_KEY_ID_SECRET_NAME=${BRANCH_PREFIX//-/_}ORG_${ACCESS_KEY_PREFIX}AWS_ACCESS_KEY_ID" >> $GITHUB_ENV
+          echo "ORG_AWS_SECRET_ACCESS_KEY_SECRET_NAME=${BRANCH_PREFIX//-/_}ORG_${ACCESS_KEY_PREFIX}AWS_SECRET_ACCESS_KEY" >> $GITHUB_ENV
+
+      - name: Test Secret names for Org Access
+        run: |
+          if [ -z "${{ secrets[env.ORG_AWS_ACCESS_KEY_ID_SECRET_NAME] }}" -o \
+               -z "${{ secrets[env.ORG_AWS_SECRET_ACCESS_KEY_SECRET_NAME] }}" ] ; then
+            echo 'Missing Secret names for Org Access!' ; exit 1
+          fi
+
+      - name: AWS SSM parameters to environment variables
+        uses: Bardavon-Health/actions-aws-ssm-params-to-env@v1.2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets[env.ORG_AWS_ACCESS_KEY_ID_SECRET_NAME] }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets[env.ORG_AWS_SECRET_ACCESS_KEY_SECRET_NAME] }}
+          AWS_DEFAULT_REGION: ${{ matrix.region }}
+        with:
+          ssm-path: /github/actions/${{ github.event.repository.name }}/${{ env.BRANCH_NAME }}
+
+      - name: Get Secret Name for AWS Account ID
+        run: |
+          if [ -z "$BRANCH_PREFIX" ] ; then
+            echo "ACCOUNT_ID_SECRET_NAME=${BRANCH_ENV^^}_AWS_ACCOUNT_ID" >> $GITHUB_ENV
+          else
+            echo "ACCOUNT_ID_SECRET_NAME=${BRANCH_PREFIX//-/_}AWS_ACCOUNT_ID" >> $GITHUB_ENV
+          fi
+
+      - name: Test Secret Name for AWS Account ID
+        run: |
+          if [ -z "${{ secrets[env.ACCOUNT_ID_SECRET_NAME] }}" ] ; then
+            echo 'Missing secret names for AWS Account ID!' ; exit 1
+          fi
+
+      - name: Set Assume Role Name
+        run: |
+          if [ -z "$BRANCH_PREFIX" ] ; then
+            echo 'ASSUME_ROLE_ACCOUNT_ID=${{ secrets.ASSUME_ROLE_AWS_ACCOUNT_ID }}' >> $GITHUB_ENV
+          else
+            echo 'ASSUME_ROLE_ACCOUNT_ID=${{ secrets[env.ACCOUNT_ID_SECRET_NAME] }}' >> $GITHUB_ENV
+          fi
+          if [[ "$REPO_SUFFIX" == "-security" ]] ; then
+            if [[ $BRANCH_NAME =~ ^.+-iam$ ]] ; then
+               echo 'ASSUME_ROLE_NAME=${{ secrets.ORG_IAM_DEPLOY_ROLE_NAME }}' >> $GITHUB_ENV
+               echo 'IAM_INDICATOR=iam-' >> $GITHUB_ENV
+            else
+               echo 'ASSUME_ROLE_NAME=${{ secrets.ORG_SECURITY_DEPLOY_ROLE_NAME }}' >> $GITHUB_ENV
+               echo 'IAM_INDICATOR=' >> $GITHUB_ENV
+            fi
+          else
+            if [[ -z "$AWS_ASSUME_ROLE_NAME" ]] ; then
+              echo "ASSUME_ROLE_NAME=${BRANCH_PREFIX,,}bardGithubDeploy-${REPO_COMPANY}-${REPO_APP}-${BRANCH_ENV}" >> $GITHUB_ENV
+            else
+              echo "ASSUME_ROLE_NAME=$AWS_ASSUME_ROLE_NAME" >> $GITHUB_ENV
+            fi
+            echo 'IAM_INDICATOR=' >> $GITHUB_ENV
+          fi
+
+      - name: Test Assume Role Name
+        run: |
+          if [ -z "ASSUME_ROLE_ACCOUNT_ID" -o \
+               -z "$ASSUME_ROLE_NAME" ] ; then
+            echo 'Missing secret names for AWS Account IDs!' ; exit 1
+          fi
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets[env.ORG_AWS_ACCESS_KEY_ID_SECRET_NAME] }}
+          aws-secret-access-key: ${{ secrets[env.ORG_AWS_SECRET_ACCESS_KEY_SECRET_NAME] }}
+          aws-region: ${{ matrix.region }}
+          role-to-assume: 'arn:aws:iam::${{ secrets[env.ACCOUNT_ID_SECRET_NAME] }}:role/${{ env.ASSUME_ROLE_NAME }}'
+          role-duration-seconds: 1200
+
+      - name: Get Secret Names for TFC ORG/TOKEN
+        run: |
+          echo "TFC_ORG_SECRET_NAME=${BRANCH_PREFIX//-/_}TFC_ORG" >> $GITHUB_ENV
+          echo "TFC_TEAM_API_TOKEN_SECRET_NAME=${BRANCH_PREFIX//-/_}TFC_TEAM_API_TOKEN" >> $GITHUB_ENV
+
+      - name: Test Secret Names for TFC ORG/TOKEN
+        run: |
+          if [ -z "${{ secrets[env.TFC_ORG_SECRET_NAME] }}" -o \
+               -z "${{ secrets[env.TFC_TEAM_API_TOKEN_SECRET_NAME] }}" ] ; then
+            echo 'Missing Secret names for TFC ORG/TOKEN!' ; exit 1
+          fi
+
+      - name: Define TF_VARS
+        run: |
+          echo "TF_VAR_REPO=${REPO_PROVIDER}-${REPO_COMPANY}-${REPO_APP}${REPO_SUFFIX}" >> $GITHUB_ENV
+          echo "TF_VAR_PROVIDER=$REPO_PROVIDER" >> $GITHUB_ENV
+          echo "TF_VAR_COMPANY=$REPO_COMPANY" >> $GITHUB_ENV
+          echo "TF_VAR_APP=$REPO_APP" >> $GITHUB_ENV
+          echo "TF_VAR_ENVIRONMENT=$BRANCH_ENV" >> $GITHUB_ENV
+          echo "TF_VAR_RESOURCE_PREFIX=${BRANCH_PREFIX,,}" >> $GITHUB_ENV
+          echo "TF_VAR_REMOTE_PREFIX=${BRANCH_PREFIX}" >> $GITHUB_ENV
+          echo "TF_VAR_REMOTE_APP_PREFIX=${BRANCH_PREFIX}" >> $GITHUB_ENV
+          echo "TF_VAR_ORG=${{ secrets[env.TFC_ORG_SECRET_NAME] }}" >> $GITHUB_ENV
+          echo "TF_VAR_ASSUME_ROLE_ACCOUNT_ID=$ASSUME_ROLE_ACCOUNT_ID" >> $GITHUB_ENV
+
+      - name: Set Workspace Name
+        run: echo "WORKSPACE_NAME=${BRANCH_PREFIX}${{ github.event.repository.name }}-${IAM_INDICATOR}${TF_VAR_ENVIRONMENT}-${{ matrix.region }}" >> $GITHUB_ENV
+
+      - name: Terraform Cloud Create Workspace
+        uses: Bardavon-Health/actions-terraform-cloud-create-workspace@v1
+        with:
+          token: ${{ secrets[env.TFC_TEAM_API_TOKEN_SECRET_NAME] }}
+          name: ${{ env.WORKSPACE_NAME }}
+          org: ${{ secrets[env.TFC_ORG_SECRET_NAME] }}
+          exec_mode: local
+          env: ${{ env.TF_VAR_ENVIRONMENT }}
+
+      - name: Derive Terraform Working Dir
+        run: |
+          if [ -z "$TF_WORKING_DIR" ] ; then
+            if [ -d terraform ] ; then
+              echo "TF_WORKING_DIR=`echo 'terraform'`" >> $GITHUB_ENV
+            else
+              echo "TF_WORKING_DIR=`echo '.'`" >> $GITHUB_ENV
+            fi
+          fi
+
+      - name: Set Backend Args for Terraform Init
+        run: |
+          echo 'hostname = "app.terraform.io"' >> $TF_WORKING_DIR/tf-backend.hcl
+          echo 'organization = "${{ secrets[env.TFC_ORG_SECRET_NAME] }}"' >> $TF_WORKING_DIR/tf-backend.hcl
+          echo 'workspaces { name = "${{ env.WORKSPACE_NAME }}" }' >> $TF_WORKING_DIR/tf-backend.hcl
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v1
+        with:
+          cli_config_credentials_token: ${{ secrets[env.TFC_TEAM_API_TOKEN_SECRET_NAME] }}
+
+      - name: Terraform Log Version
+        id: version
+        run: terraform -version
+
+      - name: Terraform Init
+        id: init
+        run: terraform -chdir=${{ env.TF_WORKING_DIR }} init -backend-config=tf-backend.hcl
+
+      - name: Terraform Apply
+        run: terraform -chdir=${{ env.TF_WORKING_DIR }} apply -auto-approve -input=false
